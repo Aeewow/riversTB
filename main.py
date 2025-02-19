@@ -7,120 +7,171 @@ from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 import geopandas as gpd
 from shapely.geometry import Point, LineString
-
-def get_side_of_line(point: Point, line: LineString) -> str:
-    """
-    Возвращает 'left' или 'right' в зависимости от того,
-    слева или справа находится точка относительно направления линии.
-    """
-    # 1) Находим расстояние вдоль линии (проекция точки на линию)
-    dist_along_line = line.project(point)
-    # 2) Вычисляем координаты "ближайшей" точки на линии
-    point_on_line = line.interpolate(dist_along_line)
-
-    # Чтобы понять «вектор направления» линии, возьмём небольшое смещение вдоль неё
-    delta = 0.0001
-    dist_next = dist_along_line + delta
-    if dist_next > line.length:  # если вышли за пределы
-        dist_next = dist_along_line - delta
-
-    point_on_line_next = line.interpolate(dist_next)
-
-    # Вектор вдоль линии
-    v_line = np.array([
-        point_on_line_next.x - point_on_line.x,
-        point_on_line_next.y - point_on_line.y
-    ])
-    # Вектор от линии к нашей точке
-    v_point = np.array([
-        point.x - point_on_line.x,
-        point.y - point_on_line.y
-    ])
-
-    # Псевдоскалярное произведение
-    cross_prod = np.cross(v_line, v_point)
-
-    return "left" if cross_prod > 0 else "right"
-
-def cluster_dbscan(geo_df, eps=0.2, min_samples=5):
-    if len(geo_df) == 0:
-        geo_df["cluster"] = -1
-        return geo_df
-
-    coords = np.array([(pt.x, pt.y) for pt in geo_df.geometry])
-    scaler = StandardScaler()
-    coords_scaled = scaler.fit_transform(coords)
-    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-    labels = dbscan.fit_predict(coords_scaled)
-    geo_df["cluster"] = labels
-    return geo_df
+import json
+import glob
+import os
+from geopy.distance import geodesic
 
 def load_and_prepare_data():
-    # Загрузка Excel с данными
-    df = pd.read_excel("data2.xlsx")
+    json_files = glob.glob("buildsKirovsk_json/*.json")
+    data_list = []
+    
+    for file in json_files:
+        with open(file, 'r', encoding='utf-8') as f:
+            try:
+                json_data = json.load(f)
+                if 'result' in json_data and 'items' in json_data['result']:
+                    for item in json_data['result']['items']:
+                        if 'address' in item and 'components' in item['address'] and 'geometry' in item:
+                            street = None
+                            house_number = None
+                            for component in item['address']['components']:
+                                if 'street' in component:
+                                    street = component['street']
+                                if 'number' in component:
+                                    house_number = component['number']
+                            
+                            if street and house_number and 'centroid' in item['geometry']:
+                                centroid = item['geometry']['centroid']
+                                coords = centroid.replace('POINT(', '').replace(')', '').split()
+                                if len(coords) == 2:
+                                    lon, lat = map(float, coords)
+                                    # Проверка на корректность координат
+                                    if -180 <= lon <= 180 and -90 <= lat <= 90:
+                                        data_list.append({
+                                            'Улица': street,
+                                            'Номер дома': house_number,
+                                            'Широта': lat,
+                                            'Долгота': lon,
+                                            'cluster': 0
+                                        })
+                                    else:
+                                        print(f"Invalid coordinates for {street} {house_number}")
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                print(f"Error processing file {file}: {str(e)}")
+                continue
+    
+    if not data_list:
+        raise ValueError("No building data found in JSON files")
+    
+    df = pd.DataFrame(data_list)
+    required_columns = ['Широта', 'Долгота']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise KeyError(f"Missing required columns: {', '.join(missing_columns)}")
+    
     df = df.dropna(subset=['Широта', 'Долгота'])
+    
+    if len(df) == 0:
+        raise ValueError("No valid building data after filtering")
 
-    # Загрузка реки из GeoJSON
-    river_gdf = gpd.read_file("riverMAin.json")
-    river_line = river_gdf.geometry.iloc[0]
-
-    # Создание GeoDataFrame
     gdf = gpd.GeoDataFrame(
         df,
-        geometry=gpd.points_from_xy(df['Широта'], df['Долгота']),
+        geometry=gpd.points_from_xy(df['Долгота'], df['Широта']),
         crs="EPSG:4326"
     )
 
-    # Определение стороны реки
-    gdf["side"] = gdf.geometry.apply(lambda p: get_side_of_line(p, river_line))
+    return df, gdf
 
-    return df, gdf, river_line
-
-def perform_clustering(selected_streets=None):
-    # Загрузка и подготовка данных
-    df, gdf, river_line = load_and_prepare_data()
-
-    # Фильтрация по выбранным улицам
-    if selected_streets:
-        gdf = gdf[gdf['Улица'].isin(selected_streets)].copy()
-        if len(gdf) == 0:
-            print("No buildings found for selected streets.")
-            return
-
-    # Разделение на левый и правый берег
-    left_points = gdf[gdf["side"] == "left"].copy()
-    right_points = gdf[gdf["side"] == "right"].copy()
-
-    # Кластеризация
-    left_clustered = cluster_dbscan(left_points, eps=0.2, min_samples=5)
-    right_clustered = cluster_dbscan(right_points, eps=0.2, min_samples=5)
-
-    # Объединение результатов
-    all_clustered = pd.concat([left_clustered, right_clustered]).sort_index()
-
-    # Сохранение результатов
-    result_df = all_clustered[['Широта', 'Долгота', 'Кластер']]
-    result_df.to_csv('clustered_buildings.csv', sep=';', index=False)
-
-    print("Clustering completed and saved to clustered_buildings.csv.")
-    return result_df
-
-if __name__ == '__main__':
-    # Этот код будет выполняться только при прямом запуске файла
-    df = perform_clustering()
+def save_coordinates(selected_streets=None):
+    df, _ = load_and_prepare_data()
     
-    # Визуализация
+    if selected_streets:
+        df = df[df['Улица'].isin(selected_streets)].copy()
+        if len(df) == 0:
+            print("No buildings found for selected streets")
+            return None
+    
+    df['cluster'] = 0
+    df.to_csv('clustered_buildings.csv', index=False, encoding='utf-8')
+    print("Coordinates successfully written to clustered_buildings.csv")
+    
+    return df
+
+def load_street_network():
+    streets = gpd.read_file("Иркутск_Модель_Граф/Сеть_link.shp", encoding='cp1251')
+    nodes = gpd.read_file("Иркутск_Модель_Граф/Сеть_node.shp", encoding='cp1251')
+    return streets, nodes
+
+def find_nearest_street(point, streets):
+    point_geom = Point(point['Долгота'], point['Широта'])
+    distances = streets.geometry.distance(point_geom)
+    return distances.idxmin()
+
+def perform_clustering(selected_streets=None, eps_meters=200, street_multiplier=1.5, min_samples=5):
+    """
+    Кластеризация с учетом улиц через кастомную матрицу расстояний:
+      - если здания на разных улицах, умножаем расстояние на street_multiplier
+      - eps_meters — радиус для DBSCAN в метрах
+      - min_samples — минимальное число точек для образования кластера
+    """
+    # 1. Загружаем исходные данные
+    df, _ = load_and_prepare_data()
+
+    # 2. Фильтруем, если указаны конкретные улицы
+    if selected_streets:
+        df = df[df['Улица'].isin(selected_streets)].copy()
+        if df.empty:
+            print("No buildings found for the selected streets.")
+            return None
+
+    df.reset_index(drop=True, inplace=True)
+
+    # 3. Формируем матрицу расстояний (metric='precomputed')
+    n_samples = len(df)
+    distance_matrix = np.zeros((n_samples, n_samples))
+
+    for i in range(n_samples):
+        for j in range(i+1, n_samples):
+            latlon_i = (df.loc[i, 'Широта'], df.loc[i, 'Долгота'])
+            latlon_j = (df.loc[j, 'Широта'], df.loc[j, 'Долгота'])
+
+            # Базовое географическое расстояние в метрах
+            dist = geodesic(latlon_i, latlon_j).meters
+
+            # Если улицы разные — умножаем на коэффициент
+            if df.loc[i, 'Улица'] != df.loc[j, 'Улица']:
+                dist *= street_multiplier
+
+            distance_matrix[i, j] = dist
+            distance_matrix[j, i] = dist
+
+    # 4. Запуск DBSCAN с кастомной матрицей расстояний
+    dbscan = DBSCAN(
+        eps=eps_meters,
+        min_samples=min_samples,
+        metric='precomputed'
+    )
+    labels = dbscan.fit_predict(distance_matrix)
+    df['cluster'] = labels
+
+    # 5. Визуализация
     plt.figure(figsize=(10, 6))
-    plt.scatter(
-        df['Широта'],
+    scatter = plt.scatter(
         df['Долгота'],
+        df['Широта'],
         c=df['cluster'],
         cmap='viridis',
         marker='o',
         edgecolors='k'
     )
-    plt.xlabel('Широта')
-    plt.ylabel('Долгота')
-    plt.title('Кластеризация с учётом разделения реки (DBSCAN)')
-    plt.colorbar(label='Кластер')
+    plt.xlabel('Долгота')
+    plt.ylabel('Широта')
+    plt.title('Кластеризация зданий с учетом улиц (кастомная метрика)')
+    plt.colorbar(scatter, label='Кластер')
     plt.show()
+
+    # 6. Сохранение результата в папку clustered_buildings
+    output_dir = 'clustered_buildings'
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_file = os.path.join(output_dir, 'clustered_buildings.csv')
+    df.to_csv(output_file, index=False, encoding='utf-8')
+    print(f"Результаты кластеризации сохранены в: {output_file}")
+
+    return df
+
+if __name__ == '__main__':
+    # Пример вызова без указания улиц (кластеризуем все)
+    # Можно также передать список улиц: perform_clustering(['улица Ленина', 'улица Пушкина'], eps_meters=300, street_multiplier=2)
+    perform_clustering()
